@@ -19,6 +19,11 @@ app.get('/', (req, res) => {
   res.json({ status: 'KnowYourRights.biz Backend Running ✅' });
 });
 
+// Railway health check endpoint
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok' });
+});
+
 // ── STRIPE WEBHOOK ──
 app.post('/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
