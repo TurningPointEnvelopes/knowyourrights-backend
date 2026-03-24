@@ -4,15 +4,26 @@ const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 
+// Basic CORS so Netlify can call Railway
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
+// IMPORTANT: Raw body needed for Stripe webhook verification
+app.use('/webhook', express.raw({ type: 'application/json' }));
+app.use(express.json());
+
 // Supabase client with service role key
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
-
-// IMPORTANT: Raw body needed for Stripe webhook verification
-app.use('/webhook', express.raw({ type: 'application/json' }));
-app.use(express.json());
 
 // Health check
 app.get('/', (req, res) => {
@@ -22,6 +33,99 @@ app.get('/', (req, res) => {
 // Railway health check endpoint
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
+});
+
+// ── ASK AI ROUTE ──
+app.post('/ask', async (req, res) => {
+  try {
+    const {
+      question,
+      lang,
+      region,
+      activeArea,
+      activeSpecName,
+      isPaidUser
+    } = req.body || {};
+
+    if (!question || !question.trim()) {
+      return res.status(400).json({ error: 'Question is required' });
+    }
+
+    if (!region || !region.trim()) {
+      return res.status(400).json({ error: 'Region is required' });
+    }
+
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return res.status(500).json({ error: 'ANTHROPIC_API_KEY is missing in Railway variables' });
+    }
+
+    const systemPrompt =
+      `You are ${activeSpecName || 'Victor'}, an expert AI legal research specialist focusing on ${activeArea || 'Corporate & Business Law'}. ` +
+      `You have deep knowledge of laws, statutes, codes, regulations, and legal precedents for all 50 US states, federal US law, and legal systems in 200+ countries worldwide. ` +
+      `CRITICAL RULES: ` +
+      `1. Always respond in ${lang || 'English'}. ` +
+      `2. Provide legal RESEARCH and INFORMATION only - not legal advice. ` +
+      `3. Be specific to: ${region}. ` +
+      `4. Reference relevant statutes by name when possible. ` +
+      `5. Use clear plain language. ` +
+      `6. Cover: Situation Analysis, Relevant Laws, Exact wording to use, What NOT to say, Step-by-step actions. ` +
+      `7. Write at least 6-8 detailed paragraphs. ` +
+      `8. End with disclaimer to consult a licensed attorney.`;
+
+    const anthropicResponse = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1500,
+        system: systemPrompt,
+        messages: [
+          {
+            role: 'user',
+            content:
+              `Location: ${region}\n` +
+              `Area: ${activeArea || 'Corporate & Business Law'}\n` +
+              `Language: ${lang || 'English'}\n` +
+              `Paid User: ${isPaidUser ? 'Yes' : 'No'}\n` +
+              `Question: ${question}`
+          }
+        ]
+      })
+    });
+
+    const data = await anthropicResponse.json();
+
+    if (!anthropicResponse.ok) {
+      console.error('Anthropic API error:', data);
+      return res.status(anthropicResponse.status).json({
+        error: 'Anthropic API request failed',
+        details: data
+      });
+    }
+
+    let fullText = '';
+    if (data.content && Array.isArray(data.content)) {
+      for (const item of data.content) {
+        if (item.text) fullText += item.text;
+      }
+    }
+
+    if (!fullText) {
+      return res.status(500).json({ error: 'No response text returned from Anthropic' });
+    }
+
+    return res.json({ answer: fullText });
+  } catch (err) {
+    console.error('/ask route error:', err);
+    return res.status(500).json({
+      error: 'Server error while processing question',
+      details: err.message
+    });
+  }
 });
 
 // ── STRIPE WEBHOOK ──
@@ -48,7 +152,6 @@ app.post('/webhook', async (req, res) => {
     console.log(`Payment received from ${customerEmail} — $${amountPaid / 100}`);
 
     try {
-      // Check if user exists in subscribers table
       const { data: existing } = await supabase
         .from('subscribers')
         .select('*')
@@ -56,7 +159,6 @@ app.post('/webhook', async (req, res) => {
         .single();
 
       if (existing) {
-        // Update existing subscriber
         await supabase
           .from('subscribers')
           .update({
@@ -67,7 +169,6 @@ app.post('/webhook', async (req, res) => {
           })
           .eq('email', customerEmail);
       } else {
-        // Create new subscriber
         await supabase
           .from('subscribers')
           .insert({
@@ -121,7 +222,6 @@ app.get('/check-subscriber', async (req, res) => {
 app.post('/activate', async (req, res) => {
   const { email, plan, adminKey } = req.body;
 
-  // Simple admin protection
   if (adminKey !== process.env.ADMIN_KEY) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
