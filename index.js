@@ -24,7 +24,6 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
-
 // Health check
 app.get('/', (req, res) => {
   res.json({ status: 'KnowYourRights.biz Backend Running ✅' });
@@ -35,7 +34,6 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
 });
 
-// ── ASK AI ROUTE ──
 app.post('/ask', async (req, res) => {
   try {
     const {
@@ -127,7 +125,6 @@ app.post('/ask', async (req, res) => {
     });
   }
 });
-
 // ── STRIPE WEBHOOK ──
 app.post('/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
