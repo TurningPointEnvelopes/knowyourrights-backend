@@ -1,4 +1,4 @@
-cconst express = require('express');
+const express = require('express');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { createClient } = require('@supabase/supabase-js');
 
