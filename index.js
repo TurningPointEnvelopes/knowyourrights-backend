@@ -1,10 +1,10 @@
-const express = require('express');
+cconst express = require('express');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 
-// Basic CORS so Netlify can call Railway
+// ── CORS ─────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -15,25 +15,37 @@ app.use((req, res, next) => {
   next();
 });
 
-// IMPORTANT: Raw body needed for Stripe webhook verification
+// IMPORTANT: raw body required for Stripe webhook verification
 app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
-// Supabase client with service role key
+// ── SUPABASE ────────────────────────────────────────────────────────────────
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
-// Health check
+
+// ── HEALTH / ROOT ───────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'KnowYourRights.biz Backend Running ✅' });
+  res.json({
+    status: 'KnowYourRights.biz Backend Running ✅',
+    timestamp: new Date().toISOString()
+  });
 });
 
-// Railway health check endpoint
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
 });
 
+// ── HELPERS ─────────────────────────────────────────────────────────────────
+function getPlanFromAmount(amountPaid) {
+  if (amountPaid === 2900) return 'basic';
+  if (amountPaid === 5900) return 'pro';
+  if (amountPaid === 9900) return 'family';
+  return 'basic';
+}
+
+// ── ASK ROUTE ───────────────────────────────────────────────────────────────
 app.post('/ask', async (req, res) => {
   try {
     const {
@@ -54,7 +66,9 @@ app.post('/ask', async (req, res) => {
     }
 
     if (!process.env.ANTHROPIC_API_KEY) {
-      return res.status(500).json({ error: 'ANTHROPIC_API_KEY is missing in Railway variables' });
+      return res
+        .status(500)
+        .json({ error: 'ANTHROPIC_API_KEY is missing in Railway variables' });
     }
 
     const systemPrompt =
@@ -78,7 +92,7 @@ app.post('/ask', async (req, res) => {
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-      model: 'claude-opus-4-6',
+        model: 'claude-opus-4-6',
         max_tokens: 1500,
         system: systemPrompt,
         messages: [
@@ -125,7 +139,8 @@ app.post('/ask', async (req, res) => {
     });
   }
 });
-// ── STRIPE WEBHOOK ──
+
+// ── STRIPE WEBHOOK ──────────────────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
@@ -139,54 +154,89 @@ app.post('/webhook', async (req, res) => {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // Handle successful payment
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
-    const customerEmail = session.customer_details?.email;
-    const amountPaid = session.amount_total;
-    const paymentId = session.id;
+  try {
+    // Successful checkout payment
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const customerEmail = session.customer_details?.email || session.customer_email;
+      const amountPaid = session.amount_total || 0;
+      const paymentId = session.id;
+      const plan = getPlanFromAmount(amountPaid);
 
-    console.log(`Payment received from ${customerEmail} — $${amountPaid / 100}`);
+      if (!customerEmail) {
+        console.error('No customer email found in checkout session');
+        return res.json({ received: true });
+      }
 
-    try {
-      const { data: existing } = await supabase
+      console.log(
+        `Payment received from ${customerEmail} — $${amountPaid / 100} — plan: ${plan}`
+      );
+
+      const { data: existing, error: fetchError } = await supabase
         .from('subscribers')
         .select('*')
         .eq('email', customerEmail)
-        .single();
+        .maybeSingle();
+
+      if (fetchError) {
+        console.error('Supabase fetch error:', fetchError);
+      }
 
       if (existing) {
-        await supabase
+        const { error: updateError } = await supabase
           .from('subscribers')
           .update({
             active: true,
+            plan: plan,
             amount_paid: amountPaid / 100,
             payment_id: paymentId,
             updated_at: new Date().toISOString()
           })
           .eq('email', customerEmail);
+
+        if (updateError) {
+          console.error('Supabase update error:', updateError);
+        }
       } else {
-        await supabase
+        const { error: insertError } = await supabase
           .from('subscribers')
           .insert({
             email: customerEmail,
             active: true,
+            plan: plan,
             amount_paid: amountPaid / 100,
             payment_id: paymentId,
-            created_at: new Date().toISOString()
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
           });
+
+        if (insertError) {
+          console.error('Supabase insert error:', insertError);
+        }
       }
 
-      console.log(`✅ Subscriber activated: ${customerEmail}`);
-    } catch (dbError) {
-      console.error('Database error:', dbError);
+      console.log(`✅ Subscriber activated: ${customerEmail} on ${plan}`);
     }
-  }
 
-  res.json({ received: true });
+    // Optional: deactivate canceled subscriptions
+    if (event.type === 'customer.subscription.deleted') {
+      const subscription = event.data.object;
+      const customerId = subscription.customer;
+
+      if (customerId) {
+        const customers = await stripe.customers.list({ limit: 1, email: undefined });
+        console.log('Subscription deleted event received for customer:', customerId);
+      }
+    }
+
+    return res.json({ received: true });
+  } catch (err) {
+    console.error('Webhook processing error:', err);
+    return res.status(500).json({ error: 'Webhook processing failed' });
+  }
 });
 
-// ── CHECK SUBSCRIBER STATUS ──
+// ── CHECK SUBSCRIBER STATUS ────────────────────────────────────────────────
 app.get('/check-subscriber', async (req, res) => {
   const { email } = req.query;
 
@@ -199,59 +249,87 @@ app.get('/check-subscriber', async (req, res) => {
       .from('subscribers')
       .select('*')
       .eq('email', email)
-      .single();
+      .maybeSingle();
 
     if (error || !data) {
       return res.json({ active: false });
     }
 
     return res.json({
-      active: data.active,
+      active: !!data.active,
       email: data.email,
-      plan: data.plan || 'basic'
+      plan: data.plan || 'basic',
+      amount_paid: data.amount_paid || 0
     });
   } catch (err) {
+    console.error('/check-subscriber error:', err);
     return res.json({ active: false });
   }
 });
 
-// ── MANUAL ACTIVATE (for Cash App/Venmo/Chime payments) ──
+// ── MANUAL ACTIVATE (Cash App / Venmo / manual payments) ───────────────────
 app.post('/activate', async (req, res) => {
-  const { email, plan, adminKey } = req.body;
+  const { email, plan, adminKey } = req.body || {};
 
   if (adminKey !== process.env.ADMIN_KEY) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
+  if (!email || !plan) {
+    return res.status(400).json({ error: 'Email and plan are required' });
+  }
+
   try {
-    const { data: existing } = await supabase
+    const { data: existing, error: fetchError } = await supabase
       .from('subscribers')
       .select('*')
       .eq('email', email)
-      .single();
+      .maybeSingle();
+
+    if (fetchError) {
+      console.error('Manual activation fetch error:', fetchError);
+    }
 
     if (existing) {
-      await supabase
+      const { error: updateError } = await supabase
         .from('subscribers')
-        .update({ active: true, plan, updated_at: new Date().toISOString() })
+        .update({
+          active: true,
+          plan,
+          updated_at: new Date().toISOString()
+        })
         .eq('email', email);
+
+      if (updateError) {
+        throw updateError;
+      }
     } else {
-      await supabase
+      const { error: insertError } = await supabase
         .from('subscribers')
         .insert({
           email,
           active: true,
           plan,
-          created_at: new Date().toISOString()
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
         });
+
+      if (insertError) {
+        throw insertError;
+      }
     }
 
-    return res.json({ success: true, message: `${email} activated on ${plan} plan` });
+    return res.json({
+      success: true,
+      message: `${email} activated on ${plan} plan`
+    });
   } catch (err) {
+    console.error('/activate error:', err);
     return res.status(500).json({ error: err.message });
   }
 });
 
+// ── START ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`KnowYourRights Backend running on port ${PORT}`);
