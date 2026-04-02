@@ -16,8 +16,9 @@ app.use((req, res, next) => {
 });
 
 // IMPORTANT: raw body required for Stripe webhook verification
-app.use('/webhook', express.raw({ type: 'application/json' }));
-app.use(express.json());
+app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
+  res.sendStatus(200);
+});
 
 // ── SUPABASE ────────────────────────────────────────────────────────────────
 const supabase = createClient(
